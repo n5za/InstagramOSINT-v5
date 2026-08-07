@@ -36,6 +36,11 @@ python3 main.py -u USERNAME --all-posts
 
 # Comment Hunter: pull the target's reels/posts + the comments people wrote on them
 python3 main.py -g USERNAME
+```
+
+If `USERNAME` is the **logged-in account** (the one in `acc.txt`), `-g` instead extracts the
+comments **you** wrote on other people's reels (`comments_by_<username>.txt`) — pulled from
+your news/inbox ("X liked your comment: ..." notifications).
 
 # Standalone reverse image search on any image URL
 python3 main.py -i "https://example.com/image.jpg"

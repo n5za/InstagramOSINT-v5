@@ -410,6 +410,84 @@ def _ig_user_info(session, pk):
     return None
 
 
+def _ig_media_code(session, media_id):
+    """Resolve a media pk to its shortcode (code) via the media info API."""
+    try:
+        r = session.get(f'https://www.instagram.com/api/v1/media/{media_id}/info/', timeout=12)
+        if r.status_code == 200 and r.text.strip().startswith('{'):
+            items = r.json().get('items', [])
+            if items and items[0].get('code'):
+                return items[0]['code']
+    except Exception:
+        pass
+    try:
+        mua = ('Instagram 297.0.0.29.111 Android (33/13; 420dpi; 1080x2400; samsung; '
+               'SM-S918B; o1s; exynos2200; en_US; 440315017)')
+        r = session.get(f'https://www.instagram.com/api/v1/media/{media_id}/info/', timeout=12,
+                        headers={'User-Agent': mua, 'X-IG-App-ID': '936619743392459'})
+        if r.status_code == 200 and r.text.strip().startswith('{'):
+            items = r.json().get('items', [])
+            if items and items[0].get('code'):
+                return items[0]['code']
+    except Exception:
+        pass
+    return None
+
+
+def _comments_written_by(session, max_pages=5):
+    """Find comments the SESSION OWNER wrote on other people's reels.
+
+    Works because the session belongs to the account being investigated —
+    their news/inbox shows "X liked your comment: ..." notifications, each
+    referencing the reel (media id) where the comment was left.
+    Returns list of {media_id, code, owner, comment, reply, type}.
+    """
+    out = []
+    seen = set()
+    token = None
+    for _ in range(max_pages):
+        url = 'https://www.instagram.com/api/v1/news/inbox/?mark_as_seen=false&time=1735689600'
+        if token:
+            url += f'&continuation_token={token}'
+        try:
+            r = session.get(url, timeout=15)
+            if r.status_code != 200:
+                break
+            j = r.json()
+        except Exception:
+            break
+        stories = j.get('old_stories', [])
+        for s in stories:
+            args = s.get('args', {})
+            nn = s.get('notif_name', '')
+            if nn not in ('comment_like', 'reply_to_comment_with_threading'):
+                continue
+            txt = args.get('text', '')
+            dest = args.get('destination', '')
+            m = re.search(r'id=(\d+)', dest)
+            mid = m.group(1) if m else ''
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            code = _ig_media_code(session, mid)
+            item = {'media_id': mid, 'code': code,
+                    'owner': args.get('profile_name', ''),
+                    'comment': '', 'reply': '', 'type': nn}
+            if nn == 'comment_like':
+                cm = re.search(r'your comment: (.*)', txt)
+                item['comment'] = cm.group(1) if cm else ('[GIF comment]' if 'GIF' in txt else '[?]')
+            elif nn == 'reply_to_comment_with_threading':
+                item['reply'] = txt
+            out.append(item)
+            time.sleep(0.4)
+        if j.get('is_last_page') or not stories:
+            break
+        token = j.get('continuation_token')
+        if not token:
+            break
+    return out
+
+
 def _ig_feed(session, pk, max_pages=5):
     """Fetch posts/reels for a user. Returns list of {id, code, comments, likes, caption}."""
     posts = []
@@ -1353,6 +1431,42 @@ def standalone_username_search(username):
         print(f"  {C.G}    https://www.google.com/search?q={urllib.parse.quote(q)}{C.E}")
 
 
+def _comment_hunter_own(session, username):
+    """When the target IS the session owner: pull the comments THEY wrote on
+    other people's reels, straight from their news/inbox."""
+    print(f"  {C.G}[*] This is the logged-in account — extracting comments YOU wrote on other reels{C.E}\n")
+    found = _comments_written_by(session)
+    if not found:
+        print(f"  {C.W}[!] No comment activity found in the inbox{C.E}")
+        return
+    wrote = [f for f in found if f['type'] == 'comment_like']
+    replied = [f for f in found if f['type'] == 'reply_to_comment_with_threading']
+    print(f"  {C.G}[+] Found {len(found)} reels where @{username} commented "
+          f"({len(wrote)} comment-liked, {len(replied)} got replies){C.E}\n")
+    for f in found:
+        url = f"https://www.instagram.com/reel/{f['code']}/" if f['code'] else f"media_id:{f['media_id']}"
+        print(f"  {C.G}  reel/{f['code']}  @{f['owner']}{C.E}")
+        if f['comment']:
+            print(f"  {C.G}    you wrote: {f['comment'][:150]}{C.E}")
+        if f['reply']:
+            print(f"  {C.G}    reply: {f['reply'][:150]}{C.E}")
+        time.sleep(0.2)
+
+    path = f'comments_by_{username}.txt'
+    with open(path, 'w') as fh:
+        fh.write(f"Comments written by @{username} on other people's reels\n")
+        fh.write(f"Reels found: {len(found)} | comment-liked: {len(wrote)} | with replies: {len(replied)}\n\n")
+        for f in found:
+            url = f"https://www.instagram.com/reel/{f['code']}/" if f['code'] else f"media_id:{f['media_id']}"
+            fh.write(f"REEL {url}  (by @{f['owner']})\n")
+            if f['comment']:
+                fh.write(f"  YOU WROTE: {f['comment']}\n")
+            if f['reply']:
+                fh.write(f"  REPLY: {f['reply']}\n")
+            fh.write("\n")
+    print(f"\n  {C.G}[+] Saved: {path}{C.E}")
+
+
 def standalone_google_hack(username):
     print(f"  {C.G}[*] Comment Hunter target: @{username}{C.E}")
     print(f"  {C.G}[*] Pulling reels/posts + comments directly from Instagram{C.E}\n")
@@ -1389,6 +1503,10 @@ def standalone_google_hack(username):
         print(f"  {C.W}    If you think the account exists, it may be rate-limited/shadowbanned — add good proxies to proxies.txt and retry{C.E}")
         return
     print(f"  {C.G}[+] Resolved @{username} -> pk {pk}{C.E}\n")
+
+    if str(pk) == str(cd.get('ds_user_id')):
+        _comment_hunter_own(session, username)
+        return
 
     posts = _ig_feed(session, pk, max_pages=5)
     if not posts and PROXY_LIST:
