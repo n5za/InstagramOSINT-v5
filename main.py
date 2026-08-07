@@ -12,13 +12,14 @@ import re
 import sys
 import time
 import urllib.parse
-from datetime import datetime, timezone
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
 
-VERSION = "5.0.0"
+VERSION = "5.1.0"
 BANNER = f"""
 {'='*60}
   Instagram OSINT v{VERSION} - Professional Investigation Suite
@@ -102,12 +103,97 @@ REVERSE_ENGINES = [
     ('ImgOps', 'https://imgops.com/{}'),
 ]
 
+GOOGLE_HACK_QUERIES = [
+    ('reel-comments', '"{u}" site:instagram.com/reel'),
+    ('post-comments', '"{u}" site:instagram.com/p'),
+    ('comments', '"@{u}" site:instagram.com'),
+    ('comments', '"{u}" site:instagram.com'),
+    ('insta-activity', '"{u}" "instagram.com" comment'),
+    ('mentions', '"@{u}"'),
+    ('exact-username', '"{u}"'),
+]
+
+UA_FULL = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+
+
+def _scrape_google(q, google_abuse='', timeout=12):
+    """Scrape Google HTML results. Returns list of (title, url, snippet)."""
+    url = f'https://www.google.com/search?q={urllib.parse.quote(q)}&num=20'
+    if google_abuse:
+        url += '&google_abuse=' + urllib.parse.quote(google_abuse)
+    try:
+        r = requests.get(url, headers={'User-Agent': UA_FULL}, timeout=timeout)
+        if r.status_code != 200:
+            return []
+    except Exception:
+        return []
+    html = r.text
+    hrefs = re.findall(r'href="/url\?q=([^"&]+)&', html)
+    titles = re.findall(r'<h3[^>]*>(.*?)</h3>', html)
+    snips = re.findall(r'<div class="VwiC3b[^"]*"[^>]*>(.*?)</div>', html) or \
+        re.findall(r'<span class="aCOpRe"[^>]*>(.*?)</span>', html)
+    out = []
+    for i, url in enumerate(hrefs):
+        title = re.sub(r'<[^>]+>', '', titles[i]).strip() if i < len(titles) else ''
+        snip = re.sub(r'<[^>]+>', '', snips[i]).strip() if i < len(snips) else ''
+        if url.startswith('http'):
+            out.append((title, url, snip))
+    return out
+
+
+def _scrape_ddg(q, timeout=12):
+    """Scrape DuckDuckGo HTML results. Returns list of (title, url, snippet)."""
+    try:
+        r = requests.post('https://html.duckduckgo.com/html/',
+                          data={'q': q},
+                          headers={'User-Agent': UA_FULL},
+                          timeout=timeout)
+        if r.status_code != 200:
+            return []
+    except Exception:
+        return []
+    html = r.text
+    links = re.findall(r'class="result__a" href="([^"]+)"', html)
+    titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', html)
+    snips = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html)
+    out = []
+    for i, url in enumerate(links):
+        title = re.sub(r'<[^>]+>', '', titles[i]).strip() if i < len(titles) else ''
+        snip = re.sub(r'<[^>]+>', '', snips[i]).strip() if i < len(snips) else ''
+        if url.startswith('http'):
+            out.append((title, url, snip))
+    return out
+
+
+def _clean(s):
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def _load_google_abuse():
+    for p in ('google_abuse.txt', 'google_abuse.cookie', 'g_abuse.txt'):
+        if os.path.exists(p):
+            with open(p) as f:
+                v = f.read().strip()
+                if 'GOOGLE_ABUSE_EXEMPTION' in v:
+                    return v.split('GOOGLE_ABUSE_EXEMPTION=', 1)[1]
+                return v
+    return ''
+
 
 class InstagramOSINT:
-    def __init__(self, username, cookies_file="acc.txt", use_tor=False):
+    def __init__(self, username, cookies_file="acc.txt", use_tor=False,
+                 all_posts=False, skip_platforms=False, skip_friends=False,
+                 skip_comments=False, skip_image=False, skip_ghack=False, tz=0):
         self.username = username
         self.user_id = None
         self.use_tor = use_tor
+        self.all_posts = all_posts
+        self.skip_platforms = skip_platforms
+        self.skip_friends = skip_friends
+        self.skip_comments = skip_comments
+        self.skip_image = skip_image
+        self.skip_ghack = skip_ghack
+        self.tz = tz
         self.cookies_file = cookies_file
         self.profile = {}
         self.posts = []
@@ -117,6 +203,7 @@ class InstagramOSINT:
         self.friend_bios = {}
         self.comments = []
         self.cross_platform = {}
+        self.google_hack = {}
         self.session = None
         self.cookies_dict = {}
         self.output_dir = ""
@@ -134,16 +221,27 @@ class InstagramOSINT:
             print(f"  {color}{msg}{C.E}")
 
     def _load_cookies(self):
-        if os.path.exists(self.cookies_file):
-            with open(self.cookies_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if '=' in line:
-                        k, v = line.split('=', 1)
-                        self.cookies_dict[k.strip()] = v.strip()
+        if not os.path.exists(self.cookies_file):
+            self._log(C.W, "[!] No cookies file")
+            return
+        with open(self.cookies_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '\t' in line:
+                    parts = line.split('\t')
+                    if len(parts) >= 7:
+                        domain, _, _, _, _, name, value = parts[:7]
+                        if domain.endswith('instagram.com'):
+                            self.cookies_dict[name.strip()] = value.strip()
+                elif '=' in line:
+                    k, v = line.split('=', 1)
+                    self.cookies_dict[k.strip()] = v.strip()
+        if self.cookies_dict:
             self._log(C.G, "[+] Cookies loaded")
         else:
-            self._log(C.W, "[!] No cookies file")
+            self._log(C.W, "[!] No usable cookies found in file")
 
     def _create_session(self):
         self.session = requests.Session()
@@ -158,6 +256,16 @@ class InstagramOSINT:
                 'X-IG-App-ID': '936619743392459',
                 'X-CSRFToken': self.cookies_dict.get('csrftoken', ''),
             })
+
+    def _plain_headers(self):
+        h = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'X-IG-App-ID': '936619743392459',
+            'X-CSRFToken': self.cookies_dict.get('csrftoken', ''),
+        }
+        if self.cookies_dict:
+            h['Cookie'] = '; '.join(f"{k}={v}" for k, v in self.cookies_dict.items())
+        return h
 
     def _api(self, url, retries=2):
         for i in range(retries):
@@ -199,15 +307,27 @@ class InstagramOSINT:
         self._log(C.B, "╚═══════════════════════════════════════════════╝")
 
         data = self._api(f'https://www.instagram.com/api/v1/web/search/topsearch/?query={self.username}&context=blended')
+        similar = []
         if data and data.get('users'):
             for entry in data['users']:
                 u = entry.get('user', {})
-                if u.get('username', '').lower() == self.username.lower():
+                uname = u.get('username', '')
+                if uname.lower() == self.username.lower():
                     self.user_id = u.get('pk')
                     break
+                similar.append(uname)
+
+        if not self.user_id:
+            info = self._api(f'https://www.instagram.com/api/v1/users/web_profile_info/?username={self.username}')
+            gu = (info or {}).get('data', {}).get('user')
+            if gu:
+                self.user_id = gu.get('id')
+                self._log(C.G, f"[+] Resolved via web_profile_info (id {self.user_id})")
 
         if not self.user_id:
             self._log(C.F, f"[-] User @{self.username} not found")
+            if similar:
+                self._log(C.W, f"[?] Did you mean: {', '.join('@'+n for n in similar[:8])}?")
             sys.exit(1)
 
         info = self._api(f'https://www.instagram.com/api/v1/users/{self.user_id}/info/')
@@ -217,6 +337,7 @@ class InstagramOSINT:
 
         u = info['user']
         pic_url = u.get('hd_profile_pic_url_info', {}).get('url', '') or u.get('profile_pic_url', '')
+        bci = u.get('business_contact_info', {}) or {}
         self.profile = {
             'username': u.get('username'),
             'full_name': u.get('full_name', ''),
@@ -230,9 +351,12 @@ class InstagramOSINT:
             'business': u.get('is_business', False),
             'external_url': u.get('external_url', ''),
             'category': u.get('category', ''),
-            'email': u.get('public_email', ''),
-            'phone': u.get('public_phone_number', ''),
+            'email': u.get('public_email', '') or bci.get('email', ''),
+            'phone': u.get('public_phone_number', '') or bci.get('phone_number', ''),
             'city': u.get('city_name', ''),
+            'address': bci.get('address_street', ''),
+            'zip': bci.get('zip', ''),
+            'website': bci.get('website', ''),
             'profile_pic_url': pic_url,
         }
 
@@ -253,14 +377,88 @@ class InstagramOSINT:
         self._log(C.B, "║ [2] Posts & Engagement Analysis              ║")
         self._log(C.B, "╚═══════════════════════════════════════════════╝")
 
-        data = self._api(f'https://www.instagram.com/api/v1/feed/user/{self.user_id}/?count=12')
-        if not data:
+        if self.profile.get('private') and not self.profile.get('posts'):
+            self._log(C.W, "[!] Private account — posts are not accessible")
             return
 
-        timestamps = []
-        all_hashtags, all_mentions = Counter(), Counter()
-        total_likes, total_comments = 0, 0
+        max_id = None
+        max_pages = 100 if self.all_posts else 1
+        page = 0
+        while page < max_pages:
+            page += 1
+            endpoint = f'https://www.instagram.com/api/v1/feed/user/{self.user_id}/?count=12'
+            if max_id:
+                endpoint += f'&max_id={max_id}'
+            data = self._api(endpoint)
+            if not data:
+                break
+            self._process_feed_items(data)
+            nid = data.get('next_max_id')
+            if not nid:
+                break
+            max_id = nid
+            if self.all_posts:
+                self._log(C.G, f"[+] Fetched {len(self.posts)} posts so far...")
+                time.sleep(0.6)
 
+        if not self.posts:
+            self._log(C.W, "[!] No posts found")
+            return
+
+        self._engagement_stats()
+
+    def _engagement_stats(self):
+        n = len(self.posts)
+        timestamps = [p['ts'] for p in self.posts if p.get('ts')]
+        total_likes = sum(p['likes'] for p in self.posts)
+        total_comments = sum(p['comments'] for p in self.posts)
+        all_hashtags = Counter(h for p in self.posts for h in p.get('hashtags', []))
+        all_mentions = Counter(m for p in self.posts for m in p.get('mentions', []))
+
+        avg_likes = total_likes / n if n else 0
+        avg_comments = total_comments / n if n else 0
+        followers = self.profile.get('followers', 1)
+        er = ((avg_likes + avg_comments) / followers) * 100 if followers else 0
+
+        if timestamps:
+            earliest = min(timestamps)
+            self.created_at = datetime.fromtimestamp(earliest, tz=timezone.utc)
+            account_age_days = (datetime.now(timezone.utc) - self.created_at).days
+            self.profile['estimated_account_age_days'] = account_age_days
+            self.profile['estimated_created'] = self.created_at.strftime('%Y-%m-%d')
+        else:
+            account_age_days = 0
+
+        days_span = max(timestamps) - min(timestamps) if len(timestamps) > 1 else 1
+        days_span_days = days_span / 86400 if days_span > 0 else 1
+        posts_per_week = (n / days_span_days) * 7 if days_span_days > 0 else 0
+
+        hours = [datetime.fromtimestamp(t, tz=timezone.utc).hour for t in timestamps if t]
+        best_hour = Counter(hours).most_common(1)[0][0] if hours else 0
+
+        best_post = max(self.posts, key=lambda p: p['likes']) if self.posts else None
+
+        self.profile['engagement_rate'] = round(er, 2)
+        self.profile['avg_likes'] = round(avg_likes, 0)
+        self.profile['avg_comments'] = round(avg_comments, 0)
+        self.profile['posts_per_week'] = round(posts_per_week, 1)
+        self.profile['best_hour_utc'] = best_hour
+        self.profile['best_hour_local'] = (best_hour + self.tz) % 24
+        self.profile['top_hashtags'] = [h for h, _ in all_hashtags.most_common(10)]
+        self.profile['top_mentions'] = [m for m, _ in all_mentions.most_common(10)]
+
+        self._log(C.G, f"\n[+] 📊 Engagement Rate: {er:.2f}% (avg ❤️{avg_likes:.0f} 💬{avg_comments:.0f})")
+        self._log(C.G, f"[+] 📅 Posts/Week: {posts_per_week:.1f}")
+        self._log(C.G, f"[+] 🕐 Best hour: {best_hour}:00 UTC / {(best_hour + self.tz) % 24}:00 local")
+        self._log(C.G, f"[+] 🏆 Most liked: ❤️{best_post['likes']} ({best_post['datetime']})" if best_post else "")
+        if self.profile.get('estimated_created'):
+            self._log(C.G, f"[+] 🎂 Est. account from: {self.profile['estimated_created']} (~{account_age_days} days)")
+        if all_hashtags:
+            self._log(C.G, f"[+] 🔖 Top hashtags: {', '.join('#'+h for h,_ in all_hashtags.most_common(5))}")
+        if all_mentions:
+            self._log(C.G, f"[+] 📢 Top mentions: {', '.join('@'+m for m,_ in all_mentions.most_common(5))}")
+
+    def _process_feed_items(self, data):
         for item in data.get('items', []):
             mt = item.get('media_type', 0)
             ts = item.get('taken_at', 0)
@@ -270,14 +468,8 @@ class InstagramOSINT:
             likes = item.get('like_count', 0)
             cc = item.get('comment_count', 0)
 
-            timestamps.append(ts)
-            total_likes += likes
-            total_comments += cc
-
             tags = set(re.findall(r'#(\w+)', cap_text))
             mentions = set(re.findall(r'@(\w+)', cap_text))
-            all_hashtags.update(tags)
-            all_mentions.update(mentions)
 
             media = []
             if mt == 1:
@@ -314,58 +506,6 @@ class InstagramOSINT:
 
             cap_show = cap_text[:60] + '...' if len(cap_text) > 60 else cap_text
             self._log(C.G, f"[+] #{len(self.posts)} {self.posts[-1]['datetime']} | {self.posts[-1]['type']} | ❤️{likes} 💬{cc} | {cap_show}")
-
-        if not self.posts:
-            self._log(C.W, "[!] No posts found")
-            return
-
-        # Engagement rate
-        n = len(self.posts)
-        avg_likes = total_likes / n if n else 0
-        avg_comments = total_comments / n if n else 0
-        followers = self.profile.get('followers', 1)
-        er = ((avg_likes + avg_comments) / followers) * 100 if followers else 0
-
-        # Account age from earliest post
-        if timestamps:
-            earliest = min(timestamps)
-            self.created_at = datetime.fromtimestamp(earliest, tz=timezone.utc)
-            account_age_days = (datetime.now(timezone.utc) - self.created_at).days
-            self.profile['estimated_account_age_days'] = account_age_days
-            self.profile['estimated_created'] = self.created_at.strftime('%Y-%m-%d')
-        else:
-            account_age_days = 0
-
-        # Posting frequency
-        days_span = max(timestamps) - min(timestamps) if len(timestamps) > 1 else 1
-        days_span_days = days_span / 86400 if days_span > 0 else 1
-        posts_per_week = (n / days_span_days) * 7 if days_span_days > 0 else 0
-
-        # Best posting hour
-        hours = [datetime.fromtimestamp(t, tz=timezone.utc).hour for t in timestamps if t]
-        best_hour = Counter(hours).most_common(1)[0][0] if hours else 0
-
-        # Most liked post
-        best_post = max(self.posts, key=lambda p: p['likes']) if self.posts else None
-
-        self.profile['engagement_rate'] = round(er, 2)
-        self.profile['avg_likes'] = round(avg_likes, 0)
-        self.profile['avg_comments'] = round(avg_comments, 0)
-        self.profile['posts_per_week'] = round(posts_per_week, 1)
-        self.profile['best_hour_utc'] = best_hour
-        self.profile['top_hashtags'] = [h for h, _ in all_hashtags.most_common(10)]
-        self.profile['top_mentions'] = [m for m, _ in all_mentions.most_common(10)]
-
-        self._log(C.G, f"\n[+] 📊 Engagement Rate: {er:.2f}% (avg ❤️{avg_likes:.0f} 💬{avg_comments:.0f})")
-        self._log(C.G, f"[+] 📅 Posts/Week: {posts_per_week:.1f}")
-        self._log(C.G, f"[+] 🕐 Best hour (UTC): {best_hour}:00")
-        self._log(C.G, f"[+] 🏆 Most liked: ❤️{best_post['likes']} ({best_post['datetime']})" if best_post else "")
-        if self.profile.get('estimated_created'):
-            self._log(C.G, f"[+] 🎂 Est. account from: {self.profile['estimated_created']} (~{account_age_days} days)")
-        if all_hashtags:
-            self._log(C.G, f"[+] 🔖 Top hashtags: {', '.join('#'+h for h,_ in all_hashtags.most_common(5))}")
-        if all_mentions:
-            self._log(C.G, f"[+] 📢 Top mentions: {', '.join('@'+m for m,_ in all_mentions.most_common(5))}")
 
     def _download_pic(self):
         url = self.profile.get('profile_pic_url', '')
@@ -428,6 +568,14 @@ class InstagramOSINT:
         self._log(C.B, "║ [4] Friends (Mutuals)                        ║")
         self._log(C.B, "╚═══════════════════════════════════════════════╝")
 
+        if self.skip_friends:
+            self._log(C.W, "[!] Skipped friends analysis")
+            return
+
+        if self.profile.get('private'):
+            self._log(C.W, "[!] Private account — mutuals not accessible")
+            return
+
         f_pages = min(10, max(1, (self.profile['following'] + 49) // 50))
         fl_pages = min(10, max(1, (self.profile['followers'] + 199) // 200))
 
@@ -468,30 +616,54 @@ class InstagramOSINT:
             'teacher|professor|educator|tutor|prof': 'Education',
         }
         patterns = {}
-        for i, u in enumerate(self.friends):
+
+        def _fetch_bio(u):
             uid = u.get('pk')
             if not uid:
-                continue
+                return None
             try:
-                r = self.session.get(f'https://www.instagram.com/api/v1/users/{uid}/info/', timeout=8)
+                r = requests.get(f'https://www.instagram.com/api/v1/users/{uid}/info/',
+                                 headers=self._plain_headers(), timeout=8)
                 if r.status_code == 200:
                     bio = r.json().get('user', {}).get('biography', '')
                     if bio:
-                        self.friend_bios[u['username']] = bio
-                        text = f"{u['username']} {u.get('full_name','')} {bio}".lower()
-                        for pat, cat in keywords.items():
-                            if re.search(pat, text):
-                                patterns.setdefault(cat, []).append(u['username'])
-                                break
-            except:
+                        return u['username'], bio
+            except Exception:
                 pass
-            if (i+1) % 25 == 0:
-                time.sleep(0.5)
+            return None
+
+        bios = []
+        self._log(C.G, f"[+] Scanning {len(self.friends)} friend bios concurrently...")
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = [ex.submit(_fetch_bio, u) for u in self.friends]
+            for fut in as_completed(futs):
+                res = fut.result()
+                if res:
+                    bios.append(res)
+            time.sleep(0.3)
+
+        for uname, bio in bios:
+            self.friend_bios[uname] = bio
+            u = next((x for x in self.friends if x.get('username') == uname), {})
+            text = f"{uname} {u.get('full_name','')} {bio}".lower()
+            for pat, cat in keywords.items():
+                if re.search(pat, text):
+                    patterns.setdefault(cat, []).append(uname)
+                    break
 
         if patterns:
             self._log(C.G, "\n[+] Friend Categories:")
             for cat, accs in sorted(patterns.items()):
                 self._log(C.G, f"    {cat} ({len(accs)}): {', '.join(accs[:10])}")
+
+    def _check_platform(self, name, url):
+        try:
+            r = requests.get(url, timeout=5, headers={'User-Agent': UA_FULL}, allow_redirects=True, stream=True)
+            if r.status_code == 200:
+                return name, url
+        except Exception:
+            pass
+        return None
 
     def _username_search(self):
         self._log(C.B, "\n╔═══════════════════════════════════════════════╗")
@@ -500,16 +672,20 @@ class InstagramOSINT:
 
         uname = self.username
         found = []
-        for name, template in PLATFORMS:
-            url = template.format(uname)
-            try:
-                r = requests.head(url, timeout=6, headers={'User-Agent': 'Mozilla/5.0'}, allow_redirects=True)
-                if r.status_code == 200:
-                    self.cross_platform[name] = url
-                    found.append(f"{name}: {url}")
-                    self._log(C.G, f"  [+] {name}: {url}")
-            except:
-                pass
+        if not self.skip_platforms:
+            self._log(C.G, f"[+] Checking {len(PLATFORMS)} platforms concurrently...")
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                futs = {ex.submit(self._check_platform, name, tmpl.format(uname)): name
+                        for name, tmpl in PLATFORMS}
+                for fut in as_completed(futs):
+                    res = fut.result()
+                    if res:
+                        name, url = res
+                        self.cross_platform[name] = url
+                        found.append(f"{name}: {url}")
+                        self._log(C.G, f"  [+] {name}: {url}")
+        else:
+            self._log(C.W, "[!] Skipped platform search")
 
         # Google dork search
         dorks = [
@@ -535,6 +711,81 @@ class InstagramOSINT:
             path = os.path.join(self.output_dir, 'cross_platform.txt')
             Path(path).write_text('\n'.join(found))
         self._log(C.G, f"\n[+] Dork links saved: {dork_file}")
+
+    def _google_hacker(self):
+        self._log(C.B, "\n╔═══════════════════════════════════════════════╗")
+        self._log(C.B, "║ [5b] Google Hacker (comments/mentions)        ║")
+        self._log(C.B, "╚═══════════════════════════════════════════════╝")
+
+        if self.skip_ghack:
+            self._log(C.W, "[!] Skipped Google Hacker")
+            return
+
+        uname = self.username
+        abuse = _load_google_abuse()
+        if abuse:
+            self._log(C.G, "[+] Google abuse-exemption cookie loaded")
+
+        self._log(C.G, f"[*] Mining search engines for @{uname} comments/mentions...\n")
+
+        hits = {}  # url -> (title, snippet)
+        for label, tpl in GOOGLE_HACK_QUERIES:
+            q = tpl.format(u=uname)
+            self._log(C.G, f"  [-] dork [{label}]: \"{q}\"")
+            for engine, fn in (('Google', lambda: _scrape_google(q, abuse)),
+                               ('DuckDuckGo', lambda: _scrape_ddg(q))):
+                try:
+                    for title, url, snip in fn():
+                        if url in hits:
+                            continue
+                        hits[url] = (title or url, _clean(snip))
+                except Exception:
+                    pass
+            time.sleep(1.0)
+        self.google_hack = hits
+
+        if not hits:
+            self._log(C.W, "[!] No results from search engines")
+            return
+
+        insta = {u: v for u, v in hits.items() if 'instagram.com' in u}
+        self._log(C.G, f"\n[+] Found {len(hits)} results ({len(insta)} Instagram-related)")
+        self._log(C.G, "\n[+] Instagram results:")
+        for url, (title, snip) in list(insta.items())[:25]:
+            self._log(C.G, f"    • {url}")
+            if title and title != url:
+                self._log(C.G, f"      {title[:110]}")
+            if snip:
+                self._log(C.G, f"      {snip[:150]}")
+
+        self._log(C.G, "\n[+] Other results (possible mentions):")
+        other = {u: v for u, v in hits.items() if 'instagram.com' not in u}
+        for url, (title, snip) in list(other.items())[:15]:
+            self._log(C.G, f"    • {url}")
+            if snip:
+                self._log(C.G, f"      {snip[:150]}")
+
+        lines = [f"Google Hacker results for @{uname}",
+                 f"Searched {len(GOOGLE_HACK_QUERIES)} dorks via Google + DuckDuckGo",
+                 ""]
+        lines.append(f"== Instagram ({len(insta)}) ==")
+        for url, (title, snip) in insta.items():
+            lines.append(f"URL: {url}")
+            if title:
+                lines.append(f"TITLE: {title}")
+            if snip:
+                lines.append(f"SNIPPET: {snip}")
+            lines.append("")
+        lines.append(f"== Other ({len(other)}) ==")
+        for url, (title, snip) in other.items():
+            lines.append(f"URL: {url}")
+            if snip:
+                lines.append(f"SNIPPET: {snip}")
+            lines.append("")
+
+        path = os.path.join(self.output_dir, 'google_hacker.txt')
+        Path(path).write_text('\n'.join(lines))
+        self._log(C.G, f"\n[+] Saved: {path}")
 
     def _comments(self):
         self._log(C.B, "\n╔═══════════════════════════════════════════════╗")
@@ -582,6 +833,7 @@ class InstagramOSINT:
             'friend_categories': self.friend_bios,
             'comments': self.comments,
             'cross_platform': self.cross_platform,
+            'google_hacker': [{'url': u, 'title': v[0], 'snippet': v[1]} for u, v in self.google_hack.items()],
         }
         path = os.path.join(self.output_dir, 'data.json')
         with open(path, 'w') as f:
@@ -708,6 +960,22 @@ a{{color:#4da6ff;}}
         if cross_html:
             html += f'<div class="section"><h2>Cross-Platform ({len(self.cross_platform)})</h2>{cross_html}</div>'
 
+        if self.google_hack:
+            gh_html = ''
+            insta = {u: v for u, v in self.google_hack.items() if 'instagram.com' in u}
+            other = {u: v for u, v in self.google_hack.items() if 'instagram.com' not in u}
+            for url, (title, snip) in insta.items():
+                gh_html += f'<div class="post"><a href="{url}" target="_blank">{url}</a>'
+                if snip:
+                    gh_html += f'<div class="cap">{snip[:200]}</div>'
+                gh_html += '</div>'
+            for url, (title, snip) in other.items():
+                gh_html += f'<div class="post"><a href="{url}" target="_blank">{url}</a>'
+                if snip:
+                    gh_html += f'<div class="cap">{snip[:200]}</div>'
+                gh_html += '</div>'
+            html += f'<div class="section"><h2>Google Hacker (comments/mentions) ({len(self.google_hack)})</h2>{gh_html}</div>'
+
         if self.comments:
             html += f'<div class="section"><h2>Comments ({len(self.comments)})</h2>'
             commenters = set(c['username'] for c in self.comments if c.get('username'))
@@ -720,6 +988,7 @@ a{{color:#4da6ff;}}
 <div><a href="file://{os.path.join(abs_out, 'data.json')}">📊 data.json</a></div>
 <div><a href="file://{os.path.join(abs_out, 'friends.txt')}">👥 friends.txt</a></div>
 <div><a href="file://{os.path.join(abs_out, 'cross_platform.txt')}">🌐 cross_platform.txt</a></div>
+<div><a href="file://{os.path.join(abs_out, 'google_hacker.txt')}">🔍 google_hacker.txt</a></div>
 <div><a href="file://{os.path.join(abs_out, 'reverse_image_search_urls.txt')}">🔍 reverse_image_search_urls.txt</a></div>
 <div><a href="file://{os.path.join(abs_out, 'dork_searches.txt')}">🔎 dork_searches.txt</a></div>
 </div>
@@ -738,17 +1007,25 @@ a{{color:#4da6ff;}}
         self._log(C.B, "╚═══════════════════════════════════════════════╝")
         self._log(C.G, f"  Target: @{self.profile.get('username')} ({self.profile.get('full_name', '')})", raw=True)
         self._log(C.G, f"  Posts: {len(self.posts)} | Friends: {len(self.friends)} | Platforms: {len(self.cross_platform)}", raw=True)
+        self._log(C.G, f"  Google Hacker hits: {len(self.google_hack)} | Comments extracted: {len(self.comments)}", raw=True)
         self._log(C.G, f"  Engagement Rate: {self.profile.get('engagement_rate', 0):.2f}%", raw=True)
         self._log(C.G, f"  Output: file://{os.path.abspath(self.output_dir)}/", raw=True)
 
     def _run(self):
         self._resolve()
         self._posts()
-        pic_path = self._download_pic()
-        self._reverse_image_search(pic_path)
+        if not self.skip_image:
+            pic_path = self._download_pic()
+            self._reverse_image_search(pic_path)
+        else:
+            self._log(C.W, "[!] Skipped image search")
         self._friends()
         self._username_search()
-        self._comments()
+        self._google_hacker()
+        if not self.skip_comments:
+            self._comments()
+        else:
+            self._log(C.W, "[!] Skipped comments extraction")
         self._save()
         self._report()
         self._summary()
@@ -776,22 +1053,78 @@ def standalone_username_search(username):
         print(f"  {C.G}    https://www.google.com/search?q={urllib.parse.quote(q)}{C.E}")
 
 
+def standalone_google_hack(username):
+    print(f"  {C.G}[*] Google Hacker target: @{username}{C.E}")
+    abuse = _load_google_abuse()
+    if abuse:
+        print(f"  {C.G}[+] Google abuse-exemption cookie loaded{C.E}")
+    hits = {}
+    for label, tpl in GOOGLE_HACK_QUERIES:
+        q = tpl.format(u=username)
+        print(f"\n  {C.G}[-] dork [{label}]: \"{q}\"{C.E}")
+        for engine, fn in (('Google', lambda: _scrape_google(q, abuse)),
+                           ('DuckDuckGo', lambda: _scrape_ddg(q))):
+            try:
+                for title, url, snip in fn():
+                    if url in hits:
+                        continue
+                    hits[url] = (title or url, _clean(snip))
+            except Exception:
+                pass
+        time.sleep(1.0)
+    if not hits:
+        print(f"  {C.W}[!] No results{C.E}")
+        return
+    print(f"\n  {C.G}[+] {len(hits)} results{C.E}")
+    insta = {u: v for u, v in hits.items() if 'instagram.com' in u}
+    for url, (title, snip) in insta.items():
+        print(f"  {C.G}  • {url}{C.E}")
+        if snip:
+            print(f"  {C.G}    {snip[:150]}{C.E}")
+    path = f'google_hack_{username}.txt'
+    with open(path, 'w') as f:
+        for url, (title, snip) in hits.items():
+            f.write(f"URL: {url}\nSNIPPET: {snip}\n\n")
+    print(f"\n  {C.G}[+] Saved: {path}{C.E}")
+
+
 def main():
     print(BANNER)
     parser = argparse.ArgumentParser(description="Instagram OSINT v5")
     parser.add_argument("--username", "-u", help="Target username")
     parser.add_argument("--image", "-i", help="Reverse image search on any image URL")
     parser.add_argument("--search", "-s", help="Cross-platform username search only")
+    parser.add_argument("--ghack", "-g", help="Google Hacker: mine comments/mentions for a username")
     parser.add_argument("--cookies", "-c", default="acc.txt", help="Cookies file")
     parser.add_argument("--tor", "-t", action='store_true', help="Use Tor proxy")
+    parser.add_argument("--all-posts", action='store_true', help="Fetch ALL posts (paginated)")
+    parser.add_argument("--skip-platforms", action='store_true', help="Skip cross-platform search")
+    parser.add_argument("--skip-friends", action='store_true', help="Skip mutuals analysis")
+    parser.add_argument("--skip-comments", action='store_true', help="Skip comments extraction")
+    parser.add_argument("--skip-image", action='store_true', help="Skip profile pic + reverse image search")
+    parser.add_argument("--skip-ghack", action='store_true', help="Skip Google Hacker module")
+    parser.add_argument("--tz", type=int, default=0, help="Local timezone offset from UTC (e.g. 1 for Morocco GMT+1)")
     args = parser.parse_args()
 
     if args.image:
         standalone_reverse_image(args.image)
     elif args.search:
         standalone_username_search(args.search)
+    elif args.ghack:
+        standalone_google_hack(args.ghack)
     elif args.username:
-        InstagramOSINT(username=args.username, cookies_file=args.cookies, use_tor=args.tor)
+        InstagramOSINT(
+            username=args.username,
+            cookies_file=args.cookies,
+            use_tor=args.tor,
+            all_posts=args.all_posts,
+            skip_platforms=args.skip_platforms,
+            skip_friends=args.skip_friends,
+            skip_comments=args.skip_comments,
+            skip_image=args.skip_image,
+            skip_ghack=args.skip_ghack,
+            tz=args.tz,
+        )
     else:
         parser.print_help()
 
