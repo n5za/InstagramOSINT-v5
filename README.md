@@ -28,6 +28,10 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
+# AUTO MODE: everything in one shot (profile, posts, comments, friends,
+# cross-platform, image search, Comment Hunter) + a clean HTML report
+python3 main.py -a USERNAME
+
 # Full investigation of an Instagram account
 python3 main.py -u USERNAME
 
@@ -38,7 +42,7 @@ python3 main.py -u USERNAME --all-posts
 python3 main.py -g USERNAME
 ```
 
-If `USERNAME` is the **logged-in account** (the one in `acc.txt`), `-g` instead extracts the
+If `USERNAME` is the **logged-in account** (the one in `acc.txt`), `-g`/`-a` instead extract the
 comments **you** wrote on other people's reels (`comments_by_<username>.txt`) — pulled from
 your news/inbox ("X liked your comment: ..." notifications).
 
@@ -57,6 +61,9 @@ python3 imgmatch.py -i "https://example.com/image.jpg"
 ```bash
 # Skip slow modules to finish faster
 python3 main.py -u USERNAME --skip-platforms --skip-friends --skip-comments --skip-image --skip-ghack
+
+# Skip only the Comment Hunter step (kept in -u/-a by default)
+python3 main.py -a USERNAME --skip-hunter
 
 # Local timezone offset for "best hour" (Morocco = +1)
 python3 main.py -u USERNAME --tz 1
@@ -106,11 +113,14 @@ Without valid cookies, profile data access is limited (Instagram login wall + AP
 
 Each investigation creates a timestamped folder:
 
-- `report.html` - full HTML report
+- `report.html` - full HTML report (includes Comment Hunter + written-comments sections)
 - `data.json` - raw investigation data
 - `profile_pic.jpg` - downloaded profile picture
 - `friends.txt`, `cross_platform.txt`, `google_hacker.txt`, `dork_searches.txt` - link lists
-- `google_hack_<username>.txt` - Comment Hunter report: every post + the extracted comments
+- `comments_hunter.txt` - Comment Hunter report: reels mined + extracted comments
+  (or, for your own account, the reels where you commented + what you wrote)
+- `google_hack_<username>.txt` - standalone `-g` Comment Hunter report
+- `comments_by_<username>.txt` - standalone `-g` own-account report (reels you commented on)
 - `reverse_image_search_urls.txt` - all engine search links
 
 Image match runs create `imgmatch_<timestamp>/` with `report.html`, `matches.json`, `matches_links.txt`, `source.jpg`.

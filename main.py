@@ -19,7 +19,7 @@ from pathlib import Path
 
 import requests
 
-VERSION = "5.2.0"
+VERSION = "5.4.0"
 BANNER = f"""
 {'='*60}
   Instagram OSINT v{VERSION} - Professional Investigation Suite
@@ -522,7 +522,8 @@ def _ig_feed(session, pk, max_pages=5):
 class InstagramOSINT:
     def __init__(self, username, cookies_file="acc.txt", use_tor=False, proxy=None,
                  all_posts=False, skip_platforms=False, skip_friends=False,
-                 skip_comments=False, skip_image=False, skip_ghack=False, tz=0):
+                 skip_comments=False, skip_image=False, skip_ghack=False, tz=0,
+                 hunter=False):
         self.username = username
         self.user_id = None
         self.use_tor = use_tor
@@ -534,6 +535,7 @@ class InstagramOSINT:
         self.skip_image = skip_image
         self.skip_ghack = skip_ghack
         self.tz = tz
+        self.hunter = hunter
         self.cookies_file = cookies_file
         self.profile = {}
         self.posts = []
@@ -544,6 +546,8 @@ class InstagramOSINT:
         self.comments = []
         self.cross_platform = {}
         self.google_hack = {}
+        self.hunter_posts = []
+        self.written_comments = []
         self.session = None
         self.cookies_dict = {}
         self.output_dir = ""
@@ -1165,6 +1169,88 @@ class InstagramOSINT:
         Path(path).write_text('\n'.join(lines))
         self._log(C.G, f"\n[+] Saved: {path}")
 
+    def _comment_hunter(self):
+        """Deep comment mining on reels:
+        - target == logged-in account -> the comments THEY wrote on other reels
+        - otherwise                   -> the comments ON their reels"""
+        self._log(C.B, "\n╔═══════════════════════════════════════════════╗")
+        self._log(C.B, "║ [5c] Comment Hunter (reels + written)         ║")
+        self._log(C.B, "╚═══════════════════════════════════════════════╝")
+
+        if self.skip_ghack:
+            self._log(C.W, "[!] Skipped Comment Hunter")
+            return
+
+        lines = [f"Comment Hunter report for @{self.username}", ""]
+        out = os.path.join(self.output_dir, 'comments_hunter.txt')
+        own = str(self.user_id) == str(self.cookies_dict.get('ds_user_id'))
+
+        if own:
+            self._log(C.G, "[+] Target is the logged-in account — extracting comments they wrote on other reels")
+            found = _comments_written_by(self.session)
+            wrote = [f for f in found if f['type'] == 'comment_like']
+            replied = [f for f in found if f['type'] == 'reply_to_comment_with_threading']
+            self.written_comments = found
+            lines.append(f"Reels where @{self.username} commented: {len(found)} "
+                         f"({len(wrote)} comment-liked, {len(replied)} with replies)")
+            lines.append("")
+            for f in found:
+                url = f"https://www.instagram.com/reel/{f['code']}/" if f['code'] else f"media_id:{f['media_id']}"
+                self._log(C.G, f"  reel/{f['code']}  @{f['owner']}")
+                if f['comment']:
+                    self._log(C.G, f"    wrote: {f['comment'][:150]}")
+                if f['reply']:
+                    self._log(C.G, f"    reply: {f['reply'][:150]}")
+                lines.append(f"REEL {url}  (by @{f['owner']})")
+                if f['comment']:
+                    lines.append(f"  YOU WROTE: {f['comment']}")
+                if f['reply']:
+                    lines.append(f"  REPLY: {f['reply']}")
+                lines.append("")
+                time.sleep(0.2)
+            self._log(C.G, f"[+] {len(found)} reels where @{self.username} commented "
+                      f"({len(wrote)} comment-liked, {len(replied)} with replies)")
+        else:
+            posts = _ig_feed(self.session, self.user_id, max_pages=5)
+            if not posts:
+                self._log(C.W, "[!] No reels/posts found for reel comment mining")
+            else:
+                self._log(C.G, f"[+] {len(posts)} reels/posts found — pulling comments")
+                gh = 0
+                seen = 0
+                for p in posts:
+                    if p['comments'] == 0 or seen >= 20:
+                        continue
+                    time.sleep(1.0)
+                    cmts = _ig_comments(self.session, p['id'])
+                    for c in cmts:
+                        gh += 1
+                        self._log(C.G, f"    @{c['username']}: {c['text'][:140]}")
+                    self.hunter_posts.append({
+                        'code': p['code'], 'id': p['id'], 'likes': p['likes'],
+                        'caption': p['caption'],
+                        'comments': [{'username': c['username'], 'text': c['text']} for c in cmts],
+                    })
+                    seen += 1
+                    time.sleep(1.0)
+                self._log(C.G, f"[+] Extracted {gh} comments from {seen} reel(s)")
+                lines.append(f"Posts scanned: {len(posts)} | Reels with comments mined: {seen} | Comments: {gh}")
+                lines.append("")
+                for p in posts:
+                    url = f"https://www.instagram.com/reel/{p['code']}/" if p['code'] else f"pk:{p['id']}"
+                    lines.append(f"POST {url}  comments={p['comments']} likes={p['likes']}")
+                    if p['caption']:
+                        lines.append(f"  caption: {p['caption'][:200]}")
+                if gh:
+                    lines.append("")
+                    lines.append(f"== EXTRACTED COMMENTS ({gh}) ==")
+                    for p in self.hunter_posts:
+                        for c in p['comments']:
+                            lines.append(f"https://www.instagram.com/reel/{p['code']}/  @{c['username']}: {c['text']}")
+
+        Path(out).write_text('\n'.join(lines))
+        self._log(C.G, f"[+] Saved: {out}")
+
     def _comments(self):
         self._log(C.B, "\n╔═══════════════════════════════════════════════╗")
         self._log(C.B, "║ [6] Comments Extraction                      ║")
@@ -1173,22 +1259,12 @@ class InstagramOSINT:
         for post in self.posts:
             if post['comments'] == 0:
                 continue
-            time.sleep(1.5)
-            try:
-                r = self.session.get(
-                    f'https://www.instagram.com/api/v1/media/{post["id"]}/comments/?can_support_threading=true&count=50',
-                    timeout=15)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
-                if not data or not data.get('comments'):
-                    continue
-                for c in data['comments']:
-                    cu = c.get('user', {})
-                    self.comments.append({'post_id': post['id'], 'username': cu.get('username'), 'text': c.get('text', '')})
-                    self._log(C.G, f"    @{cu.get('username')}: {c.get('text', '')[:120]}")
-            except:
-                pass
+            time.sleep(1.0)
+            cmts = _ig_comments(self.session, post['id'])
+            for c in cmts:
+                self.comments.append({'post_id': post['id'], 'username': c['username'], 'text': c['text']})
+                self._log(C.G, f"    @{c['username']}: {c['text'][:120]}")
+            time.sleep(1.0)
 
         if self.comments:
             unique = set(c['username'] for c in self.comments if c.get('username'))
@@ -1212,6 +1288,10 @@ class InstagramOSINT:
             'comments': self.comments,
             'cross_platform': self.cross_platform,
             'google_hacker': [{'url': u, 'title': v[0], 'snippet': v[1]} for u, v in self.google_hack.items()],
+            'hunter': {
+                'reels': self.hunter_posts,
+                'written_comments': self.written_comments,
+            },
         }
         path = os.path.join(self.output_dir, 'data.json')
         with open(path, 'w') as f:
@@ -1361,12 +1441,37 @@ a{{color:#4da6ff;}}
                 html += f'<span class="tag">@{cu}</span>'
             html += '</div>'
 
+        if self.hunter_posts:
+            hunter_html = ''
+            for i, p in enumerate(self.hunter_posts):
+                url = f"https://www.instagram.com/reel/{p['code']}/" if p['code'] else f"pk:{p['id']}"
+                hunter_html += f'<div class="post"><div class="meta">#{i+1} | <a href="{url}" target="_blank">{url}</a> | ❤️{p.get("likes", 0)} | {len(p["comments"])} comments</div>'
+                if p.get('caption'):
+                    hunter_html += f'<div class="cap">{p["caption"][:200]}</div>'
+                for c in p['comments']:
+                    hunter_html += f'<div class="comment"><b>@{c["username"]}:</b> {c["text"][:200]}</div>'
+                hunter_html += '</div>'
+            html += f'<div class="section"><h2>Comment Hunter - Reels ({len(self.hunter_posts)})</h2>{hunter_html}</div>'
+
+        if self.written_comments:
+            wc_html = ''
+            for f in self.written_comments:
+                url = f"https://www.instagram.com/reel/{f['code']}/" if f['code'] else f"media_id:{f['media_id']}"
+                wc_html += f'<div class="post"><div class="meta"><a href="{url}" target="_blank">reel/{f["code"]}</a> | by @{f["owner"]}</div>'
+                if f['comment']:
+                    wc_html += f'<div class="comment"><b>You wrote:</b> {f["comment"][:200]}</div>'
+                if f['reply']:
+                    wc_html += f'<div class="comment"><b>Your reply:</b> {f["reply"][:200]}</div>'
+                wc_html += '</div>'
+            html += f'<div class="section"><h2>Comments Written By Target ({len(self.written_comments)})</h2>{wc_html}</div>'
+
         html += f'''
 <div class="section"><h2>Open Reports</h2>
 <div><a href="file://{os.path.join(abs_out, 'data.json')}">📊 data.json</a></div>
 <div><a href="file://{os.path.join(abs_out, 'friends.txt')}">👥 friends.txt</a></div>
 <div><a href="file://{os.path.join(abs_out, 'cross_platform.txt')}">🌐 cross_platform.txt</a></div>
 <div><a href="file://{os.path.join(abs_out, 'google_hacker.txt')}">🔍 google_hacker.txt</a></div>
+<div><a href="file://{os.path.join(abs_out, 'comments_hunter.txt')}">💬 comments_hunter.txt</a></div>
 <div><a href="file://{os.path.join(abs_out, 'reverse_image_search_urls.txt')}">🔍 reverse_image_search_urls.txt</a></div>
 <div><a href="file://{os.path.join(abs_out, 'dork_searches.txt')}">🔎 dork_searches.txt</a></div>
 </div>
@@ -1386,6 +1491,8 @@ a{{color:#4da6ff;}}
         self._log(C.G, f"  Target: @{self.profile.get('username')} ({self.profile.get('full_name', '')})", raw=True)
         self._log(C.G, f"  Posts: {len(self.posts)} | Friends: {len(self.friends)} | Platforms: {len(self.cross_platform)}", raw=True)
         self._log(C.G, f"  Google Hacker hits: {len(self.google_hack)} | Comments extracted: {len(self.comments)}", raw=True)
+        hunter_n = sum(len(p['comments']) for p in self.hunter_posts)
+        self._log(C.G, f"  Comment Hunter: {len(self.hunter_posts)} reels mined ({hunter_n} comments) | written: {len(self.written_comments)}", raw=True)
         self._log(C.G, f"  Engagement Rate: {self.profile.get('engagement_rate', 0):.2f}%", raw=True)
         self._log(C.G, f"  Output: file://{os.path.abspath(self.output_dir)}/", raw=True)
 
@@ -1400,6 +1507,8 @@ a{{color:#4da6ff;}}
         self._friends()
         self._username_search()
         self._google_hacker()
+        if self.hunter:
+            self._comment_hunter()
         if not self.skip_comments:
             self._comments()
         else:
@@ -1572,7 +1681,8 @@ def standalone_google_hack(username):
 def main():
     print(BANNER)
     parser = argparse.ArgumentParser(description="Instagram OSINT v5")
-    parser.add_argument("--username", "-u", help="Target username")
+    parser.add_argument("--username", "-u", help="Full investigation on a target username")
+    parser.add_argument("--auto", "-a", help="AUTO MODE: everything + Comment Hunter + report in one shot")
     parser.add_argument("--image", "-i", help="Reverse image search on any image URL")
     parser.add_argument("--search", "-s", help="Cross-platform username search only")
     parser.add_argument("--ghack", "-g", help="Google Hacker: mine comments/mentions for a username")
@@ -1584,7 +1694,8 @@ def main():
     parser.add_argument("--skip-friends", action='store_true', help="Skip mutuals analysis")
     parser.add_argument("--skip-comments", action='store_true', help="Skip comments extraction")
     parser.add_argument("--skip-image", action='store_true', help="Skip profile pic + reverse image search")
-    parser.add_argument("--skip-ghack", action='store_true', help="Skip Google Hacker module")
+    parser.add_argument("--skip-ghack", action='store_true', help="Skip Google Hacker + Comment Hunter modules")
+    parser.add_argument("--skip-hunter", action='store_true', help="Skip Comment Hunter (reels + written comments)")
     parser.add_argument("--tz", type=int, default=0, help="Local timezone offset from UTC (e.g. 1 for Morocco GMT+1)")
     args = parser.parse_args()
     _load_proxies(args.proxy)
@@ -1595,19 +1706,24 @@ def main():
         standalone_username_search(args.search)
     elif args.ghack:
         standalone_google_hack(args.ghack)
-    elif args.username:
+    elif args.auto or args.username:
+        target = args.auto or args.username
+        auto = bool(args.auto)
+        if auto:
+            print(f"  {C.H}{C.BO}>>> AUTO MODE: running everything on @{target} <<<{C.E}")
         InstagramOSINT(
-            username=args.username,
+            username=target,
             cookies_file=args.cookies,
             use_tor=args.tor,
             proxy=args.proxy,
-            all_posts=args.all_posts,
+            all_posts=args.all_posts or auto,
             skip_platforms=args.skip_platforms,
             skip_friends=args.skip_friends,
             skip_comments=args.skip_comments,
             skip_image=args.skip_image,
             skip_ghack=args.skip_ghack,
             tz=args.tz,
+            hunter=not args.skip_hunter,
         )
     else:
         parser.print_help()
