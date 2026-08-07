@@ -19,7 +19,7 @@ from pathlib import Path
 
 import requests
 
-VERSION = "5.4.0"
+VERSION = "5.4.1"
 BANNER = f"""
 {'='*60}
   Instagram OSINT v{VERSION} - Professional Investigation Suite
@@ -671,6 +671,25 @@ class InstagramOSINT:
             if gu:
                 self.user_id = gu.get('id')
                 self._log(C.G, f"[+] Resolved via web_profile_info (id {self.user_id})")
+
+        if not self.user_id:
+            # Authoritative mobile endpoint — works even when web_profile_info is 429
+            try:
+                mua = ('Instagram 297.0.0.29.111 Android (33/13; 420dpi; 1080x2400; samsung; '
+                       'SM-S918B; o1s; exynos2200; en_US; 440315017)')
+                r = self.session.get(
+                    f'https://www.instagram.com/api/v1/users/{self.username}/usernameinfo/',
+                    timeout=15, headers={'User-Agent': mua})
+                if r.status_code == 200 and r.text.strip().startswith('{'):
+                    u = r.json().get('user', {})
+                    uid = u.get('pk') or u.get('id')
+                    if uid:
+                        self.user_id = uid
+                        self._log(C.G, f"[+] Resolved via usernameinfo (id {self.user_id})")
+                elif r.status_code == 404:
+                    self._log(C.W, "[!] usernameinfo: definitive 404 — account does not exist")
+            except Exception:
+                pass
 
         if not self.user_id:
             self._log(C.F, f"[-] User @{self.username} not found")
