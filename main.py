@@ -389,6 +389,27 @@ def _ig_resolve(session, username):
     return None, similar, blocked
 
 
+def _ig_user_info(session, pk):
+    """Fetch basic user stats via mobile API. Returns dict or None."""
+    mua = ('Instagram 297.0.0.29.111 Android (33/13; 420dpi; 1080x2400; samsung; '
+           'SM-S918B; o1s; exynos2200; en_US; 440315017)')
+    try:
+        r = session.get(f'https://www.instagram.com/api/v1/users/{pk}/info/', timeout=15,
+                        headers={'User-Agent': mua})
+        if r.status_code == 200 and r.text.strip().startswith('{'):
+            u = r.json().get('user', {})
+            return {
+                'username': u.get('username'),
+                'media_count': u.get('media_count'),
+                'followers': u.get('follower_count'),
+                'following': u.get('following_count'),
+                'is_private': u.get('is_private'),
+            }
+    except Exception:
+        pass
+    return None
+
+
 def _ig_feed(session, pk, max_pages=5):
     """Fetch posts/reels for a user. Returns list of {id, code, comments, likes, caption}."""
     posts = []
@@ -1377,7 +1398,16 @@ def standalone_google_hack(username):
         time.sleep(0.5)
         posts = _ig_feed(session, pk, max_pages=5)
     if not posts:
-        print(f"  {C.W}[!] No posts fetched (private account or rate-limited?){C.E}")
+        ui = _ig_user_info(session, pk)
+        if ui is not None:
+            if ui.get('media_count') == 0:
+                print(f"  {C.W}[!] @{username} exists but has {ui.get('media_count')} posts — nothing to extract{C.E}")
+            elif ui.get('is_private'):
+                print(f"  {C.W}[!] @{username} is private ({ui.get('followers')} followers) — posts not accessible{C.E}")
+            else:
+                print(f"  {C.W}[!] Feed empty for @{username} ({ui.get('media_count')} posts, {ui.get('followers')} followers){C.E}")
+        else:
+            print(f"  {C.W}[!] No posts fetched (private account or rate-limited?){C.E}")
         return
     print(f"  {C.G}[+] {len(posts)} reels/posts found{C.E}")
 
