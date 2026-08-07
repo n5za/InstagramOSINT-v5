@@ -19,7 +19,7 @@ from pathlib import Path
 
 import requests
 
-VERSION = "5.1.0"
+VERSION = "5.2.0"
 BANNER = f"""
 {'='*60}
   Instagram OSINT v{VERSION} - Professional Investigation Suite
@@ -165,6 +165,30 @@ def _scrape_ddg(q, timeout=12):
     return out
 
 
+def _scrape_bing_rss(q, timeout=12):
+    """Scrape Bing via its RSS output (reliable, no JS). Returns list of (title, url, snippet)."""
+    out = []
+    try:
+        r = requests.get('https://www.bing.com/search',
+                         params={'q': q, 'format': 'rss', 'setlang': 'en', 'cc': 'us'},
+                         headers={'User-Agent': UA_FULL},
+                         timeout=timeout)
+        if r.status_code != 200:
+            return []
+        for item in re.findall(r'<item>(.*?)</item>', r.text, re.S):
+            tm = re.search(r'<title>(.*?)</title>', item, re.S)
+            lm = re.search(r'<link>(.*?)</link>', item, re.S)
+            dm = re.search(r'<description>(.*?)</description>', item, re.S)
+            title = _clean(tm.group(1)) if tm else ''
+            link = _clean(lm.group(1)) if lm else ''
+            desc = _clean(dm.group(1)) if dm else ''
+            if link.startswith('http'):
+                out.append((title, link, desc))
+    except Exception:
+        pass
+    return out
+
+
 def _clean(s):
     return re.sub(r'\s+', ' ', s).strip()
 
@@ -178,6 +202,155 @@ def _load_google_abuse():
                     return v.split('GOOGLE_ABUSE_EXEMPTION=', 1)[1]
                 return v
     return ''
+
+
+def _build_ig_session(cookies_file='acc.txt'):
+    """Build a requests.Session from acc.txt (Netscape or name=value format)."""
+    cd = {}
+    if os.path.exists(cookies_file):
+        with open(cookies_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '\t' in line:
+                    parts = line.split('\t')
+                    if len(parts) >= 7:
+                        d, _, _, _, _, n, v = parts[:7]
+                        if d.endswith('instagram.com'):
+                            cd[n.strip()] = v.strip()
+                elif '=' in line:
+                    k, v = line.split('=', 1)
+                    cd[k.strip()] = v.strip()
+    s = requests.Session()
+    if cd.get('sessionid'):
+        s.cookies.update(cd)
+        s.headers.update({
+            'User-Agent': UA_FULL,
+            'X-IG-App-ID': '936619743392459',
+            'X-CSRFToken': cd.get('csrftoken', ''),
+        })
+    return s, cd
+
+
+_IG_MEDIA_DOC_ID = '10015901848480474'
+
+
+def _ig_shortcode_pk(session, code):
+    """Resolve a reel/post shortcode to its media pk via web GraphQL."""
+    try:
+        data = {
+            'fb_api_caller_class': 'RelayModern',
+            'fb_api_req_friendly_name': 'PolarisPostActionLoadPostQueryQuery',
+            'server_timestamps': 'true',
+            'doc_id': _IG_MEDIA_DOC_ID,
+            'variables': json.dumps({'shortcode': code}, separators=(',', ':')),
+        }
+        r = session.post('https://www.instagram.com/graphql/query/', data=data, timeout=15)
+        if r.status_code == 200:
+            sm = r.json().get('data', {}).get('xdt_shortcode_media') or {}
+            if sm.get('id'):
+                return str(sm['id'])
+    except Exception:
+        pass
+    return None
+
+
+_IG_COMMENTS_DOC_ID = '6974885689225067'
+
+
+def _ig_comments(session, pk, count=50):
+    """Fetch comments for a media pk via web GraphQL (doc_id-based).
+    Returns list of {username, text}."""
+    out = []
+    cursor = None
+    while len(out) < count:
+        variables = {
+            'after': cursor, 'before': None, 'first': 50, 'last': None,
+            'media_id': str(pk), 'sort_order': 'popular',
+        }
+        data = {
+            'fb_api_caller_class': 'RelayModern',
+            'fb_api_req_friendly_name': 'PolarisPostCommentsPaginationQuery',
+            'server_timestamps': 'true',
+            'doc_id': _IG_COMMENTS_DOC_ID,
+            'variables': json.dumps(variables, separators=(',', ':')),
+        }
+        try:
+            r = session.post('https://www.instagram.com/graphql/query/', data=data, timeout=15)
+            if r.status_code != 200:
+                break
+            body = r.json()
+            d = body.get('data') or {}
+            key = next((k for k in d if 'comment' in k.lower()), None)
+            if not key:
+                break
+            item = d[key]
+            for edge in item.get('edges', []):
+                n = edge.get('node', {})
+                u = n.get('user', {}) or {}
+                out.append({'username': u.get('username', '?'), 'text': n.get('text', '')})
+            pinfo = item.get('page_info', {})
+            if not pinfo.get('has_next_page') or not pinfo.get('end_cursor'):
+                break
+            cursor = pinfo.get('end_cursor')
+        except Exception:
+            break
+    return out[:count]
+
+
+def _ig_resolve(session, username):
+    """Resolve a username to its Instagram pk. Returns (pk, similar_usernames)."""
+    similar = []
+    try:
+        r = session.get(f'https://www.instagram.com/api/v1/web/search/topsearch/?query={username}&context=blended',
+                        timeout=15)
+        if r.status_code == 200:
+            for e in r.json().get('users', []):
+                u = e.get('user', {})
+                uname = u.get('username', '')
+                if uname.lower() == username.lower():
+                    return u.get('pk'), similar
+                similar.append(uname)
+        info = session.get(f'https://www.instagram.com/api/v1/users/web_profile_info/?username={username}', timeout=15)
+        if info.status_code == 200:
+            gu = info.json().get('data', {}).get('user')
+            if gu:
+                return gu.get('id'), similar
+    except Exception:
+        pass
+    return None, similar
+
+
+def _ig_feed(session, pk, max_pages=5):
+    """Fetch posts/reels for a user. Returns list of {id, code, comments, likes, caption}."""
+    posts = []
+    max_id = None
+    for _ in range(max_pages):
+        url = f'https://www.instagram.com/api/v1/feed/user/{pk}/?count=12'
+        if max_id:
+            url += f'&max_id={max_id}'
+        try:
+            r = session.get(url, timeout=15)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            for item in data.get('items', []):
+                cap = item.get('caption', {}) or {}
+                posts.append({
+                    'id': item.get('id', '').split('_')[0],
+                    'code': item.get('code', ''),
+                    'comments': item.get('comment_count', 0),
+                    'likes': item.get('like_count', 0),
+                    'caption': cap.get('text', ''),
+                })
+            nid = data.get('next_max_id')
+            if not nid:
+                break
+            max_id = nid
+        except Exception:
+            break
+    return posts
 
 
 class InstagramOSINT:
@@ -732,7 +905,8 @@ class InstagramOSINT:
         for label, tpl in GOOGLE_HACK_QUERIES:
             q = tpl.format(u=uname)
             self._log(C.G, f"  [-] dork [{label}]: \"{q}\"")
-            for engine, fn in (('Google', lambda: _scrape_google(q, abuse)),
+            for engine, fn in (('Bing', lambda: _scrape_bing_rss(q)),
+                               ('Google', lambda: _scrape_google(q, abuse)),
                                ('DuckDuckGo', lambda: _scrape_ddg(q))):
                 try:
                     for title, url, snip in fn():
@@ -765,6 +939,33 @@ class InstagramOSINT:
             if snip:
                 self._log(C.G, f"      {snip[:150]}")
 
+        gh_comments = []
+        reel_urls = [u for u in insta if re.search(r'/(?:reel|p|tv)/([A-Za-z0-9_-]+)', u)]
+        if reel_urls and self.cookies_dict.get('sessionid'):
+            self._log(C.G, f"\n[+] Fetching real comments from {len(reel_urls)} reels/posts (up to 10)...")
+            for url in reel_urls[:10]:
+                m = re.search(r'/(?:reel|p|tv)/([A-Za-z0-9_-]+)', url)
+                if not m:
+                    continue
+                code = m.group(1)
+                pk = _ig_shortcode_pk(self.session, code)
+                if not pk:
+                    self._log(C.W, f"    [!] Could not resolve {url}")
+                    continue
+                time.sleep(1.0)
+                cmts = _ig_comments(self.session, pk)
+                for c in cmts:
+                    gh_comments.append({'post_id': code, 'username': c['username'], 'text': c['text']})
+                    self._log(C.G, f"    @{c['username']}: {c['text'][:140]}")
+                time.sleep(1.0)
+            if gh_comments:
+                self.comments.extend(gh_comments)
+                self._log(C.G, f"\n[+] Extracted {len(gh_comments)} comments from {len(set(c['post_id'] for c in gh_comments))} reel(s)")
+            else:
+                self._log(C.W, "[!] No comments fetched (rate-limited or private?)")
+        elif reel_urls:
+            self._log(C.W, "\n[!] No valid sessionid in acc.txt — cannot fetch real comments")
+
         lines = [f"Google Hacker results for @{uname}",
                  f"Searched {len(GOOGLE_HACK_QUERIES)} dorks via Google + DuckDuckGo",
                  ""]
@@ -781,6 +982,12 @@ class InstagramOSINT:
             lines.append(f"URL: {url}")
             if snip:
                 lines.append(f"SNIPPET: {snip}")
+            lines.append("")
+
+        if gh_comments:
+            lines.append(f"== EXTRACTED COMMENTS ({len(gh_comments)}) ==")
+            for c in gh_comments:
+                lines.append(f"[reel/{c['post_id']}] @{c['username']}: {c['text']}")
             lines.append("")
 
         path = os.path.join(self.output_dir, 'google_hacker.txt')
@@ -1054,37 +1261,60 @@ def standalone_username_search(username):
 
 
 def standalone_google_hack(username):
-    print(f"  {C.G}[*] Google Hacker target: @{username}{C.E}")
-    abuse = _load_google_abuse()
-    if abuse:
-        print(f"  {C.G}[+] Google abuse-exemption cookie loaded{C.E}")
-    hits = {}
-    for label, tpl in GOOGLE_HACK_QUERIES:
-        q = tpl.format(u=username)
-        print(f"\n  {C.G}[-] dork [{label}]: \"{q}\"{C.E}")
-        for engine, fn in (('Google', lambda: _scrape_google(q, abuse)),
-                           ('DuckDuckGo', lambda: _scrape_ddg(q))):
-            try:
-                for title, url, snip in fn():
-                    if url in hits:
-                        continue
-                    hits[url] = (title or url, _clean(snip))
-            except Exception:
-                pass
-        time.sleep(1.0)
-    if not hits:
-        print(f"  {C.W}[!] No results{C.E}")
+    print(f"  {C.G}[*] Comment Hunter target: @{username}{C.E}")
+    print(f"  {C.G}[*] Pulling reels/posts + comments directly from Instagram{C.E}\n")
+
+    session, cd = _build_ig_session()
+    if not cd.get('sessionid'):
+        print(f"  {C.W}[!] No valid sessionid in acc.txt — cannot fetch comments from Instagram{C.E}")
         return
-    print(f"\n  {C.G}[+] {len(hits)} results{C.E}")
-    insta = {u: v for u, v in hits.items() if 'instagram.com' in u}
-    for url, (title, snip) in insta.items():
-        print(f"  {C.G}  • {url}{C.E}")
-        if snip:
-            print(f"  {C.G}    {snip[:150]}{C.E}")
+
+    pk, similar = _ig_resolve(session, username)
+    if not pk:
+        print(f"  {C.W}[!] User @{username} not found{C.E}")
+        if similar:
+            print(f"  {C.W}    Did you mean: {', '.join(f'@{s}' for s in similar[:8])}{C.E}")
+        return
+    print(f"  {C.G}[+] Resolved @{username} -> pk {pk}{C.E}\n")
+
+    posts = _ig_feed(session, pk, max_pages=5)
+    if not posts:
+        print(f"  {C.W}[!] No posts fetched (private account or rate-limited?){C.E}")
+        return
+    print(f"  {C.G}[+] {len(posts)} reels/posts found{C.E}")
+
+    gh_comments = []
+    seen_posts = 0
+    for p in posts:
+        if p['comments'] == 0 or seen_posts >= 20:
+            continue
+        time.sleep(1.0)
+        cmts = _ig_comments(session, p['id'])
+        for c in cmts:
+            gh_comments.append({'post_id': p['code'] or p['id'], 'username': c['username'], 'text': c['text']})
+            print(f"  {C.G}    @{c['username']}: {c['text'][:140]}{C.E}")
+        seen_posts += 1
+        time.sleep(1.0)
+
+    if gh_comments:
+        print(f"\n  {C.G}[+] Extracted {len(gh_comments)} comments from {len(set(c['post_id'] for c in gh_comments))} post(s){C.E}")
+    else:
+        print(f"\n  {C.W}[!] No comments fetched (no comments on posts, private, or rate-limited){C.E}")
+
     path = f'google_hack_{username}.txt'
     with open(path, 'w') as f:
-        for url, (title, snip) in hits.items():
-            f.write(f"URL: {url}\nSNIPPET: {snip}\n\n")
+        f.write(f"Comment Hunter report for @{username} (pk {pk})\n")
+        f.write(f"Posts scanned: {len(posts)}\n")
+        f.write(f"Comments extracted: {len(gh_comments)}\n\n")
+        for p in posts:
+            url = f"https://www.instagram.com/reel/{p['code']}/" if p['code'] else f"pk:{p['id']}"
+            f.write(f"POST {url}  comments={p['comments']} likes={p['likes']}\n")
+            if p['caption']:
+                f.write(f"  caption: {p['caption'][:200]}\n")
+        if gh_comments:
+            f.write(f"\n== EXTRACTED COMMENTS ({len(gh_comments)}) ==\n")
+            for c in gh_comments:
+                f.write(f"https://www.instagram.com/reel/{c['post_id']}/  @{c['username']}: {c['text']}\n")
     print(f"\n  {C.G}[+] Saved: {path}{C.E}")
 
 

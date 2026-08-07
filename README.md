@@ -5,8 +5,8 @@ Professional Instagram OSINT investigation suite by n5za.
 ## Features
 
 - **Full account investigation** - profile, posts, engagement metrics, mutual friends, comments
-- **Google Hacker** (`--ghack`) - mines Google + DuckDuckGo dorks to pull the target's Instagram
-  reels/posts and the comments/mentions attached to them
+- **Comment Hunter** (`-g`) - pulls the target's reels/posts straight from Instagram's GraphQL
+  API and extracts the **real comment texts** people wrote on them (no search-engine scraping)
 - **Reverse image search** - 7 engines, plus automated similarity matching (>= 80%)
 - **Image match tool** (`imgmatch.py`) - find Instagram accounts using the same picture
   - Perceptual hashing (pHash) similarity detection
@@ -34,7 +34,7 @@ python3 main.py -u USERNAME
 # Fetch ALL posts (paginated), not just the latest 12
 python3 main.py -u USERNAME --all-posts
 
-# Google Hacker: mine comments/mentions on the target's reels/posts
+# Comment Hunter: pull the target's reels/posts + the comments people wrote on them
 python3 main.py -g USERNAME
 
 # Standalone reverse image search on any image URL
@@ -83,6 +83,7 @@ Each investigation creates a timestamped folder:
 - `data.json` - raw investigation data
 - `profile_pic.jpg` - downloaded profile picture
 - `friends.txt`, `cross_platform.txt`, `google_hacker.txt`, `dork_searches.txt` - link lists
+- `google_hack_<username>.txt` - Comment Hunter report: every post + the extracted comments
 - `reverse_image_search_urls.txt` - all engine search links
 
 Image match runs create `imgmatch_<timestamp>/` with `report.html`, `matches.json`, `matches_links.txt`, `source.jpg`.
