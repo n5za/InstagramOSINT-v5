@@ -60,6 +60,28 @@ python3 main.py -u USERNAME --tz 1
 Optional: drop a `google_abuse.txt` file containing a `GOOGLE_ABUSE_EXEMPTION=...` value to
 avoid Google CAPTCHA during the Google Hacker module.
 
+### Proxies
+
+When Instagram rate-limits or IP-blocks your searches/feeds, route the tool through a proxy:
+
+```bash
+# single proxy (HTTP/SOCKS5)
+python3 main.py -g USERNAME --proxy http://user:pass@host:port
+
+# rotation list — drop proxies in proxies.txt (one per line), tool rotates on blocks
+python3 main.py -g USERNAME
+
+# Tor (requires: pip install requests[socks] + tor running on 127.0.0.1:9050)
+python3 main.py -u USERNAME --tor
+
+# refresh free proxy list into proxies.txt
+python3 fetch_proxies.py
+```
+
+Note: free proxies are mostly blocked by Instagram already. Premium/residential proxies work
+much better. The Comment Hunter rotates to the next proxy automatically when it gets blocked
+(429 / login wall / "user not found").
+
 ### Cookies
 
 Create `acc.txt` in the tool directory (one cookie per line, from browser devtools):

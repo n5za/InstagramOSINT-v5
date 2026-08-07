@@ -204,6 +204,54 @@ def _load_google_abuse():
     return ''
 
 
+PROXY_LIST = []
+_proxy_idx = 0
+_cur_proxy = None
+
+
+def _norm_proxy(p):
+    p = (p or '').strip()
+    if not p or p.startswith('#'):
+        return None
+    if '://' not in p:
+        p = 'http://' + p
+    return p if p.startswith(('http://', 'https://')) else None
+
+
+def _load_proxies(cli_proxy=None, file='proxies.txt'):
+    """Load proxies from --proxy and/or proxies.txt into PROXY_LIST."""
+    global PROXY_LIST, _proxy_idx, _cur_proxy
+    lst = []
+    if cli_proxy:
+        p = _norm_proxy(cli_proxy)
+        if p:
+            lst.append(p)
+    if os.path.exists(file):
+        with open(file) as f:
+            for line in f:
+                p = _norm_proxy(line)
+                if p:
+                    lst.append(p)
+    PROXY_LIST = list(dict.fromkeys(lst))
+    _proxy_idx = 0
+    _cur_proxy = PROXY_LIST[0] if PROXY_LIST else None
+    return _cur_proxy
+
+
+def _current_proxy():
+    return _cur_proxy
+
+
+def _next_proxy():
+    """Rotate to the next proxy. Returns None if no proxies configured."""
+    global _proxy_idx, _cur_proxy
+    if not PROXY_LIST:
+        return None
+    _proxy_idx = (_proxy_idx + 1) % len(PROXY_LIST)
+    _cur_proxy = PROXY_LIST[_proxy_idx]
+    return _cur_proxy
+
+
 def _build_ig_session(cookies_file='acc.txt'):
     """Build a requests.Session from acc.txt (Netscape or name=value format)."""
     cd = {}
@@ -223,6 +271,8 @@ def _build_ig_session(cookies_file='acc.txt'):
                     k, v = line.split('=', 1)
                     cd[k.strip()] = v.strip()
     s = requests.Session()
+    if _cur_proxy:
+        s.proxies.update({'http': _cur_proxy, 'https': _cur_proxy})
     if cd.get('sessionid'):
         s.cookies.update(cd)
         s.headers.update({
@@ -300,26 +350,43 @@ def _ig_comments(session, pk, count=50):
 
 
 def _ig_resolve(session, username):
-    """Resolve a username to its Instagram pk. Returns (pk, similar_usernames)."""
+    """Resolve a username to its Instagram pk.
+
+    Returns (pk, similar_usernames, blocked). blocked=True when Instagram
+    served a login wall / 429 / HTML instead of search data (rate-limit or
+    IP-flagged) — callers should rotate the proxy and retry.
+    """
     similar = []
+    blocked = False
     try:
         r = session.get(f'https://www.instagram.com/api/v1/web/search/topsearch/?query={username}&context=blended',
                         timeout=15)
-        if r.status_code == 200:
+        if r.status_code in (403, 429) or not r.text.strip().startswith('{'):
+            blocked = True
+        else:
             for e in r.json().get('users', []):
                 u = e.get('user', {})
                 uname = u.get('username', '')
                 if uname.lower() == username.lower():
-                    return u.get('pk'), similar
+                    return u.get('pk'), similar, False
                 similar.append(uname)
         info = session.get(f'https://www.instagram.com/api/v1/users/web_profile_info/?username={username}', timeout=15)
-        if info.status_code == 200:
+        if info.status_code in (403, 429) or not info.text.strip().startswith('{'):
+            blocked = True
+        elif info.status_code == 200:
             gu = info.json().get('data', {}).get('user')
             if gu:
-                return gu.get('id'), similar
+                return gu.get('id'), similar, False
+        ru = session.get(f'https://www.instagram.com/api/v1/users/{username}/usernameinfo/', timeout=12)
+        if ru.status_code == 200 and ru.text.strip().startswith('{'):
+            u = ru.json().get('user', {})
+            if u.get('pk') or u.get('id'):
+                return u.get('pk') or u.get('id'), similar, False
+        elif ru.status_code == 404 and ru.text.strip().startswith('{'):
+            blocked = False  # definitive "Target user not found" — not a block
     except Exception:
-        pass
-    return None, similar
+        blocked = True
+    return None, similar, blocked
 
 
 def _ig_feed(session, pk, max_pages=5):
@@ -354,12 +421,13 @@ def _ig_feed(session, pk, max_pages=5):
 
 
 class InstagramOSINT:
-    def __init__(self, username, cookies_file="acc.txt", use_tor=False,
+    def __init__(self, username, cookies_file="acc.txt", use_tor=False, proxy=None,
                  all_posts=False, skip_platforms=False, skip_friends=False,
                  skip_comments=False, skip_image=False, skip_ghack=False, tz=0):
         self.username = username
         self.user_id = None
         self.use_tor = use_tor
+        self.proxy = proxy
         self.all_posts = all_posts
         self.skip_platforms = skip_platforms
         self.skip_friends = skip_friends
@@ -421,6 +489,10 @@ class InstagramOSINT:
         if self.use_tor:
             self.session.proxies.update({'http': 'socks5://127.0.0.1:9050', 'https': 'socks5://127.0.0.1:9050'})
             self._log(C.G, "[+] Tor enabled")
+        elif self.proxy or _current_proxy():
+            p = self.proxy or _current_proxy()
+            self.session.proxies.update({'http': p, 'https': p})
+            self._log(C.G, f"[+] Using proxy: {p}")
 
         if self.cookies_dict and self.cookies_dict.get('sessionid'):
             self.session.cookies.update(self.cookies_dict)
@@ -1264,20 +1336,46 @@ def standalone_google_hack(username):
     print(f"  {C.G}[*] Comment Hunter target: @{username}{C.E}")
     print(f"  {C.G}[*] Pulling reels/posts + comments directly from Instagram{C.E}\n")
 
+    if _current_proxy():
+        print(f"  {C.G}[+] Using proxy: {_current_proxy()}{C.E}")
+    elif PROXY_LIST:
+        print(f"  {C.G}[+] {len(PROXY_LIST)} proxies loaded, rotating on blocks{C.E}")
+
     session, cd = _build_ig_session()
     if not cd.get('sessionid'):
         print(f"  {C.W}[!] No valid sessionid in acc.txt — cannot fetch comments from Instagram{C.E}")
         return
 
-    pk, similar = _ig_resolve(session, username)
+    pk = None
+    similar = []
+    max_tries = max(1, len(PROXY_LIST) or 1)
+    for attempt in range(max_tries):
+        pk, similar, blocked = _ig_resolve(session, username)
+        if pk:
+            break
+        if not blocked:
+            break
+        nxt = _next_proxy()
+        if not nxt:
+            break
+        print(f"  {C.W}[!] Blocked on this IP — rotating to {nxt}{C.E}")
+        session, cd = _build_ig_session()
+        time.sleep(0.5)
     if not pk:
         print(f"  {C.W}[!] User @{username} not found{C.E}")
         if similar:
             print(f"  {C.W}    Did you mean: {', '.join(f'@{s}' for s in similar[:8])}{C.E}")
+        print(f"  {C.W}    If you think the account exists, it may be rate-limited/shadowbanned — add good proxies to proxies.txt and retry{C.E}")
         return
     print(f"  {C.G}[+] Resolved @{username} -> pk {pk}{C.E}\n")
 
     posts = _ig_feed(session, pk, max_pages=5)
+    if not posts and PROXY_LIST:
+        nxt = _next_proxy()
+        print(f"  {C.W}[!] Feed blocked/failed — rotating to {nxt}{C.E}")
+        session, cd = _build_ig_session()
+        time.sleep(0.5)
+        posts = _ig_feed(session, pk, max_pages=5)
     if not posts:
         print(f"  {C.W}[!] No posts fetched (private account or rate-limited?){C.E}")
         return
@@ -1290,6 +1388,11 @@ def standalone_google_hack(username):
             continue
         time.sleep(1.0)
         cmts = _ig_comments(session, p['id'])
+        if not cmts and PROXY_LIST:
+            nxt = _next_proxy()
+            session, cd = _build_ig_session()
+            time.sleep(0.5)
+            cmts = _ig_comments(session, p['id'])
         for c in cmts:
             gh_comments.append({'post_id': p['code'] or p['id'], 'username': c['username'], 'text': c['text']})
             print(f"  {C.G}    @{c['username']}: {c['text'][:140]}{C.E}")
@@ -1327,6 +1430,7 @@ def main():
     parser.add_argument("--ghack", "-g", help="Google Hacker: mine comments/mentions for a username")
     parser.add_argument("--cookies", "-c", default="acc.txt", help="Cookies file")
     parser.add_argument("--tor", "-t", action='store_true', help="Use Tor proxy")
+    parser.add_argument("--proxy", "-p", default=None, help="HTTP proxy to use, e.g. http://user:pass@host:port (or drop proxies in proxies.txt, one per line)")
     parser.add_argument("--all-posts", action='store_true', help="Fetch ALL posts (paginated)")
     parser.add_argument("--skip-platforms", action='store_true', help="Skip cross-platform search")
     parser.add_argument("--skip-friends", action='store_true', help="Skip mutuals analysis")
@@ -1335,6 +1439,7 @@ def main():
     parser.add_argument("--skip-ghack", action='store_true', help="Skip Google Hacker module")
     parser.add_argument("--tz", type=int, default=0, help="Local timezone offset from UTC (e.g. 1 for Morocco GMT+1)")
     args = parser.parse_args()
+    _load_proxies(args.proxy)
 
     if args.image:
         standalone_reverse_image(args.image)
@@ -1347,6 +1452,7 @@ def main():
             username=args.username,
             cookies_file=args.cookies,
             use_tor=args.tor,
+            proxy=args.proxy,
             all_posts=args.all_posts,
             skip_platforms=args.skip_platforms,
             skip_friends=args.skip_friends,
