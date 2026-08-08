@@ -125,6 +125,12 @@ Each investigation creates a timestamped folder:
 
 Image match runs create `imgmatch_<timestamp>/` with `report.html`, `matches.json`, `matches_links.txt`, `source.jpg`.
 
+## Support
+
+If this tool helped you, consider a small donation:
+
+[![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg)](https://paypal.me/NasaNkza)
+
 ## Disclaimer
 
 For educational and authorized security research only. Respect Instagram's ToS and privacy.
